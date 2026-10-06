@@ -43,6 +43,12 @@ class Elf:
             self.segments.append(dict(type=p_type, off=p_off, vaddr=p_vaddr,
                                       filesz=p_filesz, memsz=p_memsz, flags=p_flags))
 
+        # Executáveis comerciais costumam chegar com a .shstrtab zerada: as seções existem,
+        # mas sem nome, e o pipeline as localiza por nome. Nesse caso os nomes são
+        # reconstruídos a partir de evidência estrutural (flags, entry point, module info).
+        if self.sections and not any(s["nm"] for s in self.sections):
+            self._infer_section_names()
+
         # PRX (ET_SCE_PRX = 0xFFA0): rebase to `base` and apply type-A relocations, so the
         # code has concrete addresses. After this, read_at_vaddr serves the relocated image
         # and section/segment addresses are in the rebased space.
@@ -60,6 +66,40 @@ class Elf:
 
     def sec(self, name):
         return next((s for s in self.sections if s["nm"] == name), None)
+
+    def secs(self, name):
+        return [s for s in self.sections if s["nm"] == name]
+
+    def _infer_section_names(self):
+        SHF_WRITE, SHF_ALLOC, SHF_EXECINSTR = 0x1, 0x2, 0x4
+        alloc = [s for s in self.sections if s["typ"] == 1 and s["flags"] & SHF_ALLOC]
+        code = [s for s in alloc if s["flags"] & SHF_EXECINSTR]
+        # .text: a seção executável que contém o entry point (ainda relativo, antes do rebase).
+        text = next((s for s in code if s["addr"] <= self.entry < s["addr"] + s["size"]), None)
+        if text is None:
+            return
+        text["nm"] = ".text"
+        # O linker do SDK emite um .sceStub.text por biblioteca importada, em sequência logo
+        # após .text. A faixa é unificada numa seção sintética porque sec() devolve só a
+        # primeira ocorrência de cada nome; sem contiguidade não há evidência e nada é nomeado.
+        stubs = sorted((s for s in code if s is not text), key=lambda s: s["addr"])
+        if stubs and all(a["addr"] + a["size"] == b["addr"] for a, b in zip(stubs, stubs[1:])):
+            lo, hi = stubs[0]["addr"], stubs[-1]["addr"] + stubs[-1]["size"]
+            self.sections.append(dict(stubs[0], nm=".sceStub.text", size=hi - lo))
+        # SceModuleInfo: o loader do PSP o localiza pelo p_paddr do primeiro segmento
+        # (offset no arquivo), não pelo nome da seção.
+        if struct.unpack("<H", self.data[16:18])[0] == 0xFFA0 and self.phnum:
+            p_off, p_vaddr, p_paddr = struct.unpack("<3I", self.data[self.phoff + 4:self.phoff + 16])
+            mi = p_vaddr + (p_paddr & 0x7FFFFFFF) - p_off
+            for s in alloc:
+                if s["addr"] == mi and not s["flags"] & SHF_EXECINSTR:
+                    s["nm"] = ".rodata.sceModuleInfo"
+        # Seções de dados são varridas em busca de tabelas de ponteiros de função (callbacks
+        # via jalr). Sem nomes não há como separar .rodata.sceNid/.lib.stub de .rodata, então
+        # todas entram na varredura; valores que não apontam para .text são descartados.
+        for s in alloc:
+            if not s["nm"] and not s["flags"] & SHF_EXECINSTR:
+                s["nm"] = ".data" if s["flags"] & SHF_WRITE else ".rodata"
 
     def read_at_vaddr(self, vaddr, n):
         # For a relocated PRX, serve the rebased+relocated image directly.
@@ -152,8 +192,10 @@ def trace_function(elf, start, ranges, covered, calls):
                 covered.add(pc + 4)
                 break
             # Branches: REGIMM (1), beq/bne/blez/bgtz (4-7) and their likely forms (20-23),
-            # and FPU bc1 (cop1 with rs=8). Target is intra-function; fork and continue.
-            is_branch = op in (1, 4, 5, 6, 7, 20, 21, 22, 23) or (op == 0x11 and ((word >> 21) & 0x1F) == 8)
+            # FPU bc1 (cop1 with rs=8) e VFPU bvf/bvt (cop2 com rs=8, condição em VFPU_CC).
+            # Target is intra-function; fork and continue.
+            is_branch = (op in (1, 4, 5, 6, 7, 20, 21, 22, 23)
+                         or (op in (0x11, 0x12) and ((word >> 21) & 0x1F) == 8))
             if is_branch:
                 off = word & 0xFFFF
                 off = off - 0x10000 if off & 0x8000 else off
@@ -196,14 +238,14 @@ def analyze(elf):
 
     # Function-pointer tables in read-only/data sections (callbacks reached via jalr).
     for nm in (".rodata", ".data", ".sdata"):
-        s = elf.sec(nm)
-        if not s or s["typ"] == 8:
-            continue
-        blob = section_bytes(elf, s)
-        for o in range(0, len(blob) - 3, 4):
-            val = struct.unpack("<I", blob[o:o + 4])[0]
-            if in_text(val):
-                hc.add(val)
+        for s in elf.secs(nm):
+            if s["typ"] == 8:
+                continue
+            blob = section_bytes(elf, s)
+            for o in range(0, len(blob) - 3, 4):
+                val = struct.unpack("<I", blob[o:o + 4])[0]
+                if in_text(val):
+                    hc.add(val)
 
     # Sweep executable sections: jal targets are calls (high-confidence functions); la-style
     # address materialization into code is an indirect-call target. j targets, prologues, and
@@ -215,6 +257,7 @@ def analyze(elf):
         if blob is None:
             continue
         hireg = {}
+        clear_after = False
         for off in range(0, len(blob) - 3, 4):
             word = struct.unpack("<I", blob[off:off + 4])[0]
             addr = lo + off
@@ -247,6 +290,18 @@ def analyze(elf):
                     val = hireg[rs] | (word & 0xFFFF)
                     if in_text(val):
                         hc.add(val)
+            # Um par lui/addiu só materializa um endereço enquanto o registrador ainda guarda o
+            # valor do lui. Qualquer outra escrita no registrador invalida o par (a checagem de
+            # la acima já usou o valor antigo quando rt == rs).
+            if op == 0:
+                hireg.pop((word >> 11) & 0x1F, None)                    # R-type escreve rd
+            elif 0x08 <= op <= 0x0E or 0x20 <= op <= 0x27:
+                hireg.pop((word >> 16) & 0x1F, None)                    # ALU imediato / loads escrevem rt
+            # Após jr/j/b o fluxo não continua na instrução seguinte (pode ser outra função).
+            # O delay slot ainda executa antes do desvio, então a limpeza ocorre depois dele.
+            if clear_after:
+                hireg.clear()
+            clear_after = is_uncond
 
     # Trace each function's extent from the high-confidence seeds, following discovered calls.
     # `covered` ends up holding every instruction that belongs to some known function, so the

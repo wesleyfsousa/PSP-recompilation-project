@@ -176,6 +176,29 @@ static uint32_t h_StartThread(CpuState *s) {
 }
 static uint32_t h_ExitThread(CpuState *s) { (void)s; sched_exit_current(); return 0; }
 static uint32_t h_DelayThread(CpuState *s) { sched_delay_current(A0); return 0; }
+
+/* sceKernelMemset / sceKernelMemcpy (Kernel_Library): devolvem o ponteiro de destino. Com
+ * sobreposição, a cópia segue para a frente em blocos de 8 bytes e o resto byte a byte, como
+ * o PPSSPP faz para imitar o hardware. */
+static uint32_t h_KernelMemset(CpuState *s) {
+    for (uint32_t i = 0; i < A2; i++) MEM_W8(A0 + i, (uint8_t)A1);
+    return A0;
+}
+static uint32_t h_KernelMemcpy(CpuState *s) {
+    uint32_t dst = A0, src = A1, n = A2;
+    if (dst + n < src || src + n < dst) {
+        for (uint32_t i = 0; i < n; i++) MEM_W8(dst + i, MEM_R8(src + i));
+    } else {
+        uint32_t d = dst, sp = src;
+        for (uint32_t k = n / 8; k > 0; k--, d += 8, sp += 8) {
+            uint8_t tmp[8];
+            for (int i = 0; i < 8; i++) tmp[i] = MEM_R8(sp + i);
+            for (int i = 0; i < 8; i++) MEM_W8(d + i, tmp[i]);
+        }
+        for (uint32_t k = n % 8; k > 0; k--) MEM_W8(d++, MEM_R8(sp++));
+    }
+    return dst;
+}
 static uint32_t h_ChangeThreadPriority(CpuState *s) { sched_set_priority(A0, (int)A1); return 0; }
 static uint32_t h_TerminateDeleteThread(CpuState *s) { sched_terminate_thread(A0); return 0; }
 static uint32_t h_GetThreadIdSched(CpuState *s) { (void)s; return sched_current_uid(); }
@@ -988,9 +1011,14 @@ static uint32_t h_IoReadAsync(CpuState *s) {
     return 0;
 }
 static uint32_t h_IoLseekAsync(CpuState *s) {
-    uint32_t fd = A0;
-    uint32_t pos = h_IoLseek32(s);
-    if (fd < 64 && s_fds[fd].used) s_fds[fd].async_res = (int64_t)(uint64_t)pos;
+    /* a0=fd, [a2:a3]=offset de 64 bits, t0=whence: mesma assinatura de sceIoLseek (PPSSPP
+     * WrapU_II64I). A posição de 64 bits fica guardada para o sceIoWaitAsync; a chamada só
+     * devolve v0, então o v1 do chamador é preservado. */
+    uint32_t fd = A0, v1 = s->r[3];
+    if (fd >= 64 || !s_fds[fd].used) return 0x80010009;
+    uint32_t lo = h_IoLseek(s);
+    s_fds[fd].async_res = (int64_t)(((uint64_t)s->r[3] << 32) | lo);
+    s->r[3] = v1;
     return 0;
 }
 /* Result of the most recent async close per fd slot, so the customary
@@ -1402,6 +1430,26 @@ static void ge_finish_callback(CpuState *s, uint32_t cbid, uint32_t list_id, uin
     ge_call_guest(s, cb->finish_func, list_id, cb->finish_arg ? cb->finish_arg : user_arg, cbid);
 }
 
+/* Display lists em andamento. O jogo envia a lista com stall = início (vazia) e vai liberando
+ * os comandos com sceGeListUpdateStallAddr; cada liberação executa até o novo stall. O
+ * callback de fim só dispara quando a lista realmente termina (END após FINISH). */
+#define GE_MAX_LISTS 64
+typedef struct { int used, done; uint32_t id, stall, cbid, arg; GeListCtx ctx; } GeList;
+static GeList s_ge_lists[GE_MAX_LISTS];
+
+static GeList *ge_list_find(uint32_t id) {
+    for (int i = 0; i < GE_MAX_LISTS; i++)
+        if (s_ge_lists[i].used && s_ge_lists[i].id == id) return &s_ge_lists[i];
+    return NULL;
+}
+static void ge_list_advance(CpuState *s, GeList *l) {
+    if (l->done) return;
+    if (ge_list_resume(&l->ctx, l->stall) == GE_LIST_DONE) {
+        l->done = 1;
+        ge_finish_callback(s, l->cbid, l->id, l->arg);
+    }
+}
+
 static uint32_t h_GeListEnQueue(CpuState *s) {
     /* a0=list ptr, a1=stall, a2=cbid, a3=arg. With SR_GEDUMP set, log the first list's commands
      * once (bring-up aid for the GE display-list interpreter). */
@@ -1428,8 +1476,13 @@ static uint32_t h_GeListEnQueue(CpuState *s) {
             }
         }
     }
-    ge_run_list(A0);   /* process the list now (sets GE state, rasterises any PRIM) */
-    ge_finish_callback(s, A2, list_id, A3);
+    GeList *l = NULL;
+    for (int i = 0; i < GE_MAX_LISTS && !l; i++)
+        if (!s_ge_lists[i].used || s_ge_lists[i].done) l = &s_ge_lists[i];
+    if (!l) return 0x80000022u;                      /* SCE_KERNEL_ERROR_OUT_OF_MEMORY */
+    memset(l, 0, sizeof *l);
+    l->used = 1; l->id = list_id; l->stall = A1; l->cbid = A2; l->arg = A3; l->ctx.pc = A0;
+    ge_list_advance(s, l);
     if (getenv("SR_GESIG")) {
         extern unsigned long g_ge_list_sig, g_ge_prim_count;
         static unsigned long last_sig = 0; static int call = 0;
@@ -1441,8 +1494,32 @@ static uint32_t h_GeListEnQueue(CpuState *s) {
     }
     return list_id;
 }
-static uint32_t h_GeDrawSync(CpuState *s) { (void)s; return 0; }
+static uint32_t h_GeDrawSync(CpuState *s) {
+    /* a0=modo. Modo 1 (consulta): 0 se todas as listas terminaram, senão PSP_GE_LIST_STALLING
+     * (3), porque uma lista não terminada só pode estar parada no stall. Modo 0: 0. */
+    if (A0 == 1)
+        for (int i = 0; i < GE_MAX_LISTS; i++)
+            if (s_ge_lists[i].used && !s_ge_lists[i].done) return 3u;
+    return 0;
+}
+static uint32_t h_GeListUpdateStallAddr(CpuState *s) {
+    /* a0=id da lista, a1=novo stall. */
+    GeList *l = ge_list_find(A0);
+    if (!l) return 0x80000100u;                      /* SCE_KERNEL_ERROR_INVALID_ID */
+    l->stall = A1;
+    ge_list_advance(s, l);
+    return 0;
+}
+static uint32_t h_GeListSync(CpuState *s) {
+    /* a0=id, a1=modo (0 espera, 1 consulta). A execução é síncrona: a lista já terminou ou
+     * está parada no stall (PSP_GE_LIST_COMPLETED 0 / PSP_GE_LIST_STALLING 3). Esperar uma
+     * lista parada no stall travaria também no hardware, então o modo 0 só devolve 0. */
+    GeList *l = ge_list_find(A0);
+    if (!l) return 0x80000100u;
+    return (A1 == 1 && !l->done) ? 3u : 0u;
+}
 static uint32_t h_GeEdramGetAddr(CpuState *s) { (void)s; return 0x04000000; }
+static uint32_t h_GeEdramGetSize(CpuState *s) { (void)s; return 0x00200000; }   /* PPSSPP sceGeEdramGetSize */
 static uint32_t h_GeSetCallback(CpuState *s) {
     uint32_t info = A0;
     for (uint32_t i = 0; i < (uint32_t)(sizeof(s_ge_cb) / sizeof(s_ge_cb[0])); i++) {
@@ -1709,6 +1786,13 @@ void sr_hle_init(void) {
     sr_hle_register(0x809ce29b, "sceKernelExitDeleteThread", h_ExitThread);
     sr_hle_register(0xe81caf8f, "sceKernelCreateCallback", h_module_uid);
     sr_hle_register(0xceadeb47, "sceKernelDelayThread", h_DelayThread);
+    /* O runtime ainda não notifica callbacks, então nunca há callback pendente: DelayThreadCB
+     * equivale a DelayThread e CheckCallback não executa nada (devolve 0), como no PPSSPP. */
+    sr_hle_register(0x68da9e36, "sceKernelDelayThreadCB", h_DelayThread);
+    sr_hle_register(0x349d6d6c, "sceKernelCheckCallback", h_ok);
+    sr_hle_register(0x35669d4c, "sceKernelSetCompiledSdkVersion600_602", h_SetCompiledSdkVersion);
+    sr_hle_register(0xa089eca4, "sceKernelMemset", h_KernelMemset);
+    sr_hle_register(0x1839852a, "sceKernelMemcpy", h_KernelMemcpy);
     sr_hle_register(0x94aa61ee, "sceKernelGetThreadCurrentPriority", h_GetThreadPriority);
     sr_hle_register(0x9ace131e, "sceKernelSleepThread", h_SleepThread);
     sr_hle_register(0xd59ead2f, "sceKernelWakeupThread", h_WakeupThread);
@@ -1862,7 +1946,10 @@ void sr_hle_init(void) {
     /* sceGe_user */
     sr_hle_register(0xab49e76a, "sceGeListEnQueue", h_GeListEnQueue);
     sr_hle_register(0xb287bd61, "sceGeDrawSync", h_GeDrawSync);
+    sr_hle_register(0xe0d68148, "sceGeListUpdateStallAddr", h_GeListUpdateStallAddr);
+    sr_hle_register(0x03444eb4, "sceGeListSync", h_GeListSync);
     sr_hle_register(0xe47e40e4, "sceGeEdramGetAddr", h_GeEdramGetAddr);
+    sr_hle_register(0x1f6752ad, "sceGeEdramGetSize", h_GeEdramGetSize);
     sr_hle_register(0xa4fc06a4, "sceGeSetCallback", h_GeSetCallback);
     /* sceSasCore: real VAG voice mixing (see sas_mix above). */
     sr_hle_register(0x68a46b95, "__sceSasGetEndFlag", h_SasGetEndFlag);

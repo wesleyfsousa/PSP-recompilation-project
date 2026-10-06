@@ -71,32 +71,36 @@ static uint32_t load_elf(const uint8_t *elf) {
 }
 
 static void seed_from_init(const char *trace_path, CpuState *s) {
-    FILE *f = fopen(trace_path, "rb");
-    if (!f) { fprintf(stderr, "cannot open %s\n", trace_path); exit(2); }
-    char buf[8192];
-    int found = 0;
-    while (fgets(buf, sizeof(buf), f)) {
-        if (strncmp(buf, "# init", 6) != 0)
-            continue;
-        found = 1;
-        char *tok = strtok(buf + 6, " \t\n");
-        while (tok) {
-            char *eq = strchr(tok, '=');
-            if (eq) {
-                *eq = 0;
-                uint32_t val = (uint32_t)strtoul(eq + 1, NULL, 16);
-                if (tok[0] == 'r') s->r[atoi(tok + 1)] = val;
-                else if (tok[0] == 'f' && tok[1] >= '0' && tok[1] <= '9') s->fi[atoi(tok + 1)] = val;
-                else if (strcmp(tok, "hi") == 0) s->hi = val;
-                else if (strcmp(tok, "lo") == 0) s->lo = val;
-                else if (strcmp(tok, "fcr31") == 0) s->fcr31 = val;
-            }
-            tok = strtok(NULL, " \t\n");
-        }
-        break;
+    long len;
+    uint8_t *raw = read_file(trace_path, &len);
+    char *buf = (char *)malloc((size_t)len + 1);
+    memcpy(buf, raw, (size_t)len); buf[len] = 0; free(raw);
+    /* A linha "# init" pode ser longa: além dos registradores, carrega as escritas m32 que
+     * reproduzem o estado deixado pelo loader do PSP (pilha preenchida, bloco k0, argumentos). */
+    char *line = buf;
+    while (line && strncmp(line, "# init", 6) != 0) {
+        line = strchr(line, '\n');
+        if (line) line++;
     }
-    fclose(f);
-    if (!found) { fprintf(stderr, "no '# init' in %s\n", trace_path); exit(2); }
+    if (!line) { fprintf(stderr, "no '# init' in %s\n", trace_path); exit(2); }
+    char *eol = strchr(line, '\n');
+    if (eol) *eol = 0;
+    char *tok = strtok(line + 6, " \t\r");
+    while (tok) {
+        char *eq = strchr(tok, '=');
+        if (eq) {
+            *eq = 0;
+            uint32_t val = (uint32_t)strtoul(eq + 1, NULL, 16);
+            if (strncmp(tok, "m32[", 4) == 0) sr_w32((uint32_t)strtoul(tok + 4, NULL, 16), val);
+            else if (tok[0] == 'r') s->r[atoi(tok + 1)] = val;
+            else if (tok[0] == 'f' && tok[1] >= '0' && tok[1] <= '9') s->fi[atoi(tok + 1)] = val;
+            else if (strcmp(tok, "hi") == 0) s->hi = val;
+            else if (strcmp(tok, "lo") == 0) s->lo = val;
+            else if (strcmp(tok, "fcr31") == 0) s->fcr31 = val;
+        }
+        tok = strtok(NULL, " \t\r");
+    }
+    free(buf);
 }
 
 int main(int argc, char **argv) {

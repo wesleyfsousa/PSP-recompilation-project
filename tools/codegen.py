@@ -87,10 +87,14 @@ def effect(addr, w):
         fn = funct(w)
         a, b, d, sh = rs(w), rt(w), rd(w), sa(w)
         if fn == 0x00: return wr(d, f"({R(b)} << {sh})"), None, 0           # sll
-        if fn == 0x02: return wr(d, f"({R(b)} >> {sh})"), None, 0           # srl
+        if fn == 0x02:  # srl; com rs=1 é rotr (Allegrex, PPSSPP Int_ShiftType)
+            if a == 1: return wr(d, f"sr_rotr({R(b)}, {sh})"), None, 0             # rotr
+            return wr(d, f"({R(b)} >> {sh})"), None, 0                               # srl
         if fn == 0x03: return wr(d, f"((uint32_t)((int32_t){R(b)} >> {sh}))"), None, 0  # sra
         if fn == 0x04: return wr(d, f"({R(b)} << ({R(a)} & 31))"), None, 0  # sllv
-        if fn == 0x06: return wr(d, f"({R(b)} >> ({R(a)} & 31))"), None, 0  # srlv
+        if fn == 0x06:  # srlv; com sa=1 é rotrv
+            if sh == 1: return wr(d, f"sr_rotr({R(b)}, {R(a)} & 31)"), None, 0      # rotrv
+            return wr(d, f"({R(b)} >> ({R(a)} & 31))"), None, 0                       # srlv
         if fn == 0x07: return wr(d, f"((uint32_t)((int32_t){R(b)} >> ({R(a)} & 31)))"), None, 0  # srav
         if fn == 0x0A: return f"if ({R(b)} == 0) {wr(d, R(a))}", None, 0    # movz
         if fn == 0x0B: return f"if ({R(b)} != 0) {wr(d, R(a))}", None, 0    # movn
@@ -142,7 +146,9 @@ def effect(addr, w):
         if fn == 0x20:
             sub = sa(w)
             if sub == 0x02: return wr(rd(w), f"((({R(rt(w))} & 0x00FF00FFu) << 8) | (({R(rt(w))} >> 8) & 0x00FF00FFu))"), None, 0  # wsbh
+            if sub == 0x03: return wr(rd(w), f"sr_bswap32({R(rt(w))})"), None, 0  # wsbw
             if sub == 0x10: return wr(rd(w), f"((uint32_t)(int32_t)(int8_t){R(rt(w))})"), None, 0   # seb
+            if sub == 0x14: return wr(rd(w), f"sr_bitrev({R(rt(w))})"), None, 0   # bitrev
             if sub == 0x18: return wr(rd(w), f"((uint32_t)(int32_t)(int16_t){R(rt(w))})"), None, 0  # seh
         raise Unsupported(f"SPECIAL3 funct 0x{fn:02x} at 0x{addr:08x}")
     # loads
@@ -164,6 +170,13 @@ def effect(addr, w):
     if op == 0x2E: return f"sr_swr({R(rs(w))} + {simm(w)}, {R(rt(w))});", f"(({R(rs(w))} + {simm(w)}) & ~3u)", 4  # swr
     if op == 0x31: return f"s->fi[{rt(w)}] = MEM_R32({R(rs(w))} + {simm(w)});", None, 0  # lwc1
     if op == 0x39: return f"MEM_W32({R(rs(w))} + {simm(w)}, s->fi[{rt(w)}]);", f"({R(rs(w))} + {simm(w)})", 4  # swc1
+    # cache: no PC não há cache a manter coerente; o runtime e a GE leem a RAM guest
+    # diretamente. Invalidar o icache só importaria para código automodificável, que a
+    # recompilação estática não suporta de qualquer forma.
+    if op == 0x2F: return "(void)0;", None, 0
+    # vflush/vnop/vsync (opcode 0x3F): sem efeito no PC. Só 0xFFFF0000 preserva os
+    # prefixos; os demais os consomem (Int_Vflush).
+    if op == 0x3F: return ("(void)0;" if (w & 0xFFFF0000) == 0xFFFF0000 else _EAT.strip()), None, 0
     if op == 0x11: return fpu_effect(addr, w)
     if op in (0x36, 0x3e, 0x32, 0x3a, 0x12, 0x18, 0x19, 0x1b, 0x37, 0x34, 0x3c): return vfpu_effect(addr, w)
     raise Unsupported(f"opcode 0x{op:02x} at 0x{addr:08x}")
@@ -299,10 +312,50 @@ def vfpu_effect(addr, w):
                         f"for(int _i=0;_i<{n};_i++) _d[_i]=isnan(_s[_i])?fabsf(_s[_i]):_t[_i]+_s[_i]; "
                         f"sr_vwrite(s,{_arr(di)},_d,{n},s->vfpuCtrl[2]);{_EAT}")
                 return "{ " + body + " }", None, 0
+            if op9 == 2:  # vbfy1 (Int_Vbfy): S força negate em y/w; T força swizzle yxwz.
+                si = vreg_indices(vs, n)
+                body = (f"float _s[4],_t[4],_d[4]; "
+                        f"sr_vread(_s,s,{_arr(si)},{n},s->vfpuCtrl[0]|0xA0000u); "
+                        f"sr_vread(_t,s,{_arr(si)},{n},(s->vfpuCtrl[1]&~0xFFu)|0xB1u); "
+                        f"for(int _i=0;_i<{n};_i++) _d[_i]=_s[_i]+_t[_i]; "
+                        f"sr_vwrite(s,{_arr(di)},_d,{n},s->vfpuCtrl[2]);{_EAT}")
+                return "{ " + body + " }", None, 0
+            if op9 == 5:  # vsocp (Int_Vsocp): saída com o dobro de lanes, d = clamp(t + s, 0, 1), com
+                # S forçando swizzle xxyy e negate em x/z, e T forçando as constantes 1,0,1,0. A
+                # saturação é forçada (nanclamp: NaN preservado, -0 vira +0); do prefixo D só vale
+                # a máscara de escrita.
+                on = 4 if n > 2 else 2 * n
+                si = vreg_indices(vs, n)
+                si_out = si + [si[0]] * (on - n)
+                do = vreg_indices(vd, on)
+                body = (f"float _s[4],_t[4],_d[4]; "
+                        f"sr_vread(_s,s,{_arr(si_out)},{on},(s->vfpuCtrl[0]&~0xF00FFu)|0x50050u); "
+                        f"sr_vread(_t,s,{_arr(si_out)},{on},(s->vfpuCtrl[1]&~0xFFu)|0xF011u); "
+                        f"for(int _i=0;_i<{on};_i++){{ float _x=_t[_i]+_s[_i]; _x=_x<=0.0f?0.0f:_x; _d[_i]=_x>=1.0f?1.0f:_x; }} "
+                        f"sr_vwrite(s,{_arr(do)},_d,{on},s->vfpuCtrl[2]&~0xFFu);{_EAT}")
+                return "{ " + body + " }", None, 0
+            if op9 == 10:  # vsgn (Int_Vsgn): sinal de s - t com T forçado a constantes (zero, ou
+                           # 3 com abs). Diferença denormal conta como zero, como no resto da VFPU.
+                si = vreg_indices(vs, n)
+                body = (f"float _s[4],_t[4],_d[4]; "
+                        f"sr_vread(_s,s,{_arr(si)},{n},s->vfpuCtrl[0]); "
+                        f"sr_vread(_t,s,{_arr(si)},{n},(s->vfpuCtrl[1]&~0xFFu)|0xF000u); "
+                        f"for(int _i=0;_i<{n};_i++){{ float _df=_s[_i]-_t[_i]; uint32_t _u; memcpy(&_u,&_df,4); "
+                        f"_d[_i]=(_u&0x7F800000u)==0u?0.0f:((_u>>31)?-1.0f:1.0f); }} "
+                        f"sr_vwrite(s,{_arr(di)},_d,{n},s->vfpuCtrl[2]);{_EAT}")
+                return "{ " + body + " }", None, 0
             raise Unsupported(f"VFPU9 op 0x{op9:02x} at 0x{addr:08x}")
         if jump == 0x03:  # vcst: broadcast a VFPU constant (resolved at codegen time)
             val = _flit(_VFPU_CST[(w >> 16) & 0x1F])
             body = (f"float _d[4]; for(int _i=0;_i<{n};_i++) _d[_i]={val}; "
+                    f"sr_vwrite(s,{_arr(di)},_d,{n},s->vfpuCtrl[2]);{_EAT}")
+            return "{ " + body + " }", None, 0
+        if jump == 0x14:  # vi2f (Int_Vi2f): inteiro com sinal -> float, vezes 1/2^imm. O prefixo
+                          # S age sobre os bits do inteiro (abs/negate/constantes como em float).
+            si = vreg_indices(vs, n)
+            mult = _flit(1.0 / (1 << ((w >> 16) & 0x1F)))
+            body = (f"float _s[4],_d[4]; sr_vread(_s,s,{_arr(si)},{n},s->vfpuCtrl[0]); "
+                    f"for(int _i=0;_i<{n};_i++){{ int32_t _iv; memcpy(&_iv,&_s[_i],4); _d[_i]=(float)_iv*{mult}; }} "
                     f"sr_vwrite(s,{_arr(di)},_d,{n},s->vfpuCtrl[2]);{_EAT}")
             return "{ " + body + " }", None, 0
         if jump != 0:
@@ -320,7 +373,7 @@ def vfpu_effect(addr, w):
         _TRANS = {16: "sr_vfpu_rcp(_s[_i])", 17: "sr_vfpu_rsqrt(_s[_i])",
                   18: "sr_vfpu_sin(_s[_i])", 19: "sr_vfpu_cos(_s[_i])",
                   20: "sr_vfpu_exp2(_s[_i])",
-                  22: "sr_vfpu_sqrt(_s[_i])",
+                  22: "sr_vfpu_sqrt(_s[_i])", 23: "sr_vfpu_asin(_s[_i])",
                   24: "-sr_vfpu_rcp(_s[_i])", 26: "-sr_vfpu_sin(_s[_i])"}
         if optype in _TRANS:
             si = vreg_indices(vs, n)
@@ -341,10 +394,14 @@ def vfpu_effect(addr, w):
             return "{ " + body + " }", None, 0
         raise Unsupported(f"VV2Op optype {optype} at 0x{addr:08x}")
     # lv.q / sv.q: quad load/store. vt uses bit 0 (not bits 0-1) for the high register bit.
+    # Os 2 bits baixos do imediato não fazem parte do endereço: bit 0 é o bit alto de vt e
+    # bit 1 é a flag de write-back do sv.q (PPSSPP: R(rs) + (s16)(op & 0xFFFC)).
     if op == 0x36 or op == 0x3e:
         vt = ((w >> 16) & 0x1F) | ((w & 1) << 5)
         idx = vreg_indices(vt, 4)
-        base = f"({R(rs(w))} + {simm(w)})"
+        off = w & 0xFFFC
+        off = off - 0x10000 if off & 0x8000 else off
+        base = f"({R(rs(w))} + {off})"
         if op == 0x36:  # lv.q
             parts = " ".join(f"s->vi[{idx[i]}] = MEM_R32(_a + {i*4});" for i in range(4))
             return f"{{ uint32_t _a = {base}; {parts} }}", None, 0
@@ -427,6 +484,17 @@ def vfpu_effect(addr, w):
                     else:             val = "1.0f"                        # vmone
                     writes.append(f"s->v[{mreg_index(vd, side, j, i)}]={val};")
             return "{ " + " ".join(writes) + _EAT + " }", None, 0
+        if which == 0:  # vmmov (Int_Vmmov): cópia; os prefixos S e D só valem na última coluna.
+            side = n
+            last_s = [mreg_index(vs, side, side - 1, i) for i in range(side)]
+            last_d = [mreg_index(vd, side, side - 1, i) for i in range(side)]
+            reads = " ".join(f"float _m{j}_{i}=s->v[{mreg_index(vs, side, j, i)}];"
+                             for j in range(side - 1) for i in range(side))
+            writes = " ".join(f"s->v[{mreg_index(vd, side, j, i)}]=_m{j}_{i};"
+                              for j in range(side - 1) for i in range(side))
+            body = (f"{reads} float _r[4]; sr_vread(_r,s,{_arr(last_s)},{side},s->vfpuCtrl[0]); "
+                    f"{writes} sr_vwrite(s,{_arr(last_d)},_r,{side},s->vfpuCtrl[2]);{_EAT}")
+            return "{ " + body + " }", None, 0
         raise Unsupported(f"VFPUMatrix1 which {which} at 0x{addr:08x}")
     # vcrsp.t (triple) / vqmul.q (quad): cross product / quaternion multiply (PPSSPP CrossQuat).
     if op == 0x3c and sub == 5:
@@ -532,6 +600,22 @@ def vfpu_effect(addr, w):
                 f"for(int _i=0;_i<{n};_i++) _d[_i]=_s[_i]*_sc; "
                 f"sr_vwrite(s,{_arr(di)},_d,{n},s->vfpuCtrl[2]);{_EAT}")
         return "{ " + body + " }", None, 0
+    if op == 0x3c and sub == 4:  # vmscl (Int_Vmscl): matriz * escalar. Prefixos só na última
+        # coluna: S nela, T com swizzle forçado ao lane do escalar (replica o valor) e D na escrita.
+        side = n
+        sc = vreg_indices(vt, 1)[0]
+        tlane = (vt >> 5) & 3
+        last_s = [mreg_index(vs, side, side - 1, i) for i in range(side)]
+        last_d = [mreg_index(vd, side, side - 1, i) for i in range(side)]
+        lines = [f"float _sc=s->v[{sc}];"]
+        lines += [f"float _m{j}_{i}=s->v[{mreg_index(vs, side, j, i)}]*_sc;"
+                  for j in range(side - 1) for i in range(side)]
+        lines.append(f"float _r[4],_t[4]; sr_vread(_r,s,{_arr(last_s)},{side},s->vfpuCtrl[0]); "
+                     f"sr_vread(_t,s,{_arr([sc] * 4)},4,(s->vfpuCtrl[1]&~0xFFu)|0x{tlane * 0x55:x}u); "
+                     f"for(int _i=0;_i<{side};_i++) _r[_i]*=_t[_i];")
+        lines += [f"s->v[{mreg_index(vd, side, j, i)}]=_m{j}_{i};" for j in range(side - 1) for i in range(side)]
+        lines.append(f"sr_vwrite(s,{_arr(last_d)},_r,{side},s->vfpuCtrl[2]);{_EAT}")
+        return "{ " + " ".join(lines) + " }", None, 0
     raise Unsupported(f"VFPU opcode 0x{op:02x} sub 0x{sub:x} at 0x{addr:08x}")
 
 
@@ -563,7 +647,7 @@ def fpu_effect(addr, w):
 
 def is_cond_branch(w):
     op = w >> 26
-    return op in (4, 5, 6, 7, 20, 21, 22, 23) or op == 1 or (op == 0x11 and rs(w) == 8)
+    return op in (4, 5, 6, 7, 20, 21, 22, 23) or op == 1 or (op in (0x11, 0x12) and rs(w) == 8)
 
 
 def cond_expr(w):
@@ -583,12 +667,16 @@ def cond_expr(w):
     if op == 0x11 and rs(w) == 8:
         tf = (w >> 16) & 1
         return f"(s->fpcond {'!=' if tf else '=='} 0)"        # bc1t/bc1f
+    if op == 0x12 and rs(w) == 8:  # bvf/bvt(l): bit imm3 de VFPU_CC (vfpuCtrl[3])
+        imm3, tf = (w >> 18) & 7, (w >> 16) & 1
+        return f"(((s->vfpuCtrl[3] >> {imm3}) & 1u) {'!=' if tf else '=='} 0u)"
     raise Unsupported(f"branch op 0x{op:02x}")
 
 
 def is_likely(w):
     op = w >> 26
-    return op in (20, 21, 22, 23) or (op == 1 and rt(w) in (2, 3)) or (op == 0x11 and rs(w) == 8 and ((w >> 17) & 1))
+    return (op in (20, 21, 22, 23) or (op == 1 and rt(w) in (2, 3))
+            or (op in (0x11, 0x12) and rs(w) == 8 and ((w >> 17) & 1)))
 
 
 def is_link(w):  # branch that also writes $ra
@@ -658,6 +746,11 @@ def function_flow(elf, start, ranges, known):
                 pc += 8
                 continue
             pc += 4
+        if not stack:
+            # Delay slots que também são alvo de desvio continuam em slot+4; esse caminho
+            # pode não ter sido percorrido (ex.: slot de j/jr, que não têm queda).
+            stack = [t + 4 for t in labels
+                     if t - 4 in insns and t + 4 not in seen and is_control(read32(elf, t - 4) or 0)]
     return insns, labels
 
 
@@ -678,9 +771,23 @@ def emit_function(elf, start, ranges, known):
         labels = set(labels)
         labels.add(start)
         out.append(f"    goto L_{start:08x};")
+    # bltzal/bgezal com alvo dentro da própria função é uma chamada local: o jr $ra da
+    # sub-rotina volta para o link (desvio + 8), que está nesta mesma função C. Nem todo
+    # caminho dela volta pelo link, então ela não pode virar uma função C separada.
+    link_rets = sorted(a + 8 for a in insns
+                       if is_cond_branch(read32(elf, a) or 0) and is_link(read32(elf, a) or 0)
+                       and branch_target(a, read32(elf, a)) in insns)
+    labels = set(labels) | set(link_rets)
     consumed = set()
     for addr in sorted(insns):
         if addr in consumed:
+            # Alvo de desvio que é o delay slot de outro desvio (laços de memset/memcpy do
+            # compilador): entrar aqui executa só o delay slot, sem o desvio anterior em curso,
+            # e segue para a instrução seguinte. O bloco if (0) só é alcançado pelo goto.
+            if addr in labels:
+                out.append(f"    if (0) {{ L_{addr:08x}: ;")
+                out.append(normal_line(addr, read32(elf, addr)))
+                out.append("    }")
             continue
         if addr in labels:
             out.append(f"  L_{addr:08x}: ;")
@@ -723,7 +830,10 @@ def emit_function(elf, start, ranges, known):
                 out.append(f"    sr_hle_call(s, 0x{(dsw >> 6) & 0xFFFFF:x}u); return;")
             else:
                 out.append(normal_line(ds, dsw))
-                if a == 31:
+                if a == 31 and link_rets:
+                    cases = " ".join(f"case 0x{r:08x}u: goto L_{r:08x};" for r in link_rets)
+                    out.append(f"    switch (s->r[31]) {{ {cases} }} return;")
+                elif a == 31:
                     out.append("    return;")
                 else:
                     out.append(f"    {{ uint32_t _t = {R(a)}; dispatch(s, _t); return; }}")

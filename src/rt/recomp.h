@@ -92,6 +92,21 @@ float sr_vfpu_sqrt(float x);
 float sr_vfpu_sin(float x);
 float sr_vfpu_cos(float x);
 float sr_vfpu_exp2(float x);
+float sr_vfpu_asin(float x);
+
+/* Allegrex rotr/rotrv: rotação à direita (codificadas como srl com rs=1 / srlv com sa=1). */
+static inline uint32_t sr_rotr(uint32_t x, uint32_t n) { n &= 31; return n ? (x >> n) | (x << (32 - n)) : x; }
+
+/* Allegrex BSHFL: wsbw inverte a ordem dos 4 bytes; bitrev inverte a ordem dos 32 bits. */
+static inline uint32_t sr_bswap32(uint32_t x) {
+    return (x >> 24) | ((x >> 8) & 0xFF00u) | ((x << 8) & 0xFF0000u) | (x << 24);
+}
+static inline uint32_t sr_bitrev(uint32_t x) {
+    x = ((x >> 1) & 0x55555555u) | ((x & 0x55555555u) << 1);
+    x = ((x >> 2) & 0x33333333u) | ((x & 0x33333333u) << 2);
+    x = ((x >> 4) & 0x0F0F0F0Fu) | ((x & 0x0F0F0F0Fu) << 4);
+    return sr_bswap32(x);
+}
 
 /* Single-instruction VFPU interpreter (src/rt/vfpu_interp.c). Returns SR_VFPU_COMPUTE for a
  * value-producing op (compare v[]/f[] to the reference trace), SR_VFPU_STATE for a prefix/control op
@@ -137,6 +152,18 @@ uint32_t sr_alloc_uid(void);
 
 /* sceGe display-list GPU (src/rt/ge.c): execute a GE command list, rasterising into VRAM. */
 void ge_run_list(uint32_t addr);
+
+/* Estado de execução de uma display list da GE que pode parar no endereço de stall e ser
+ * retomada depois (sceGeListUpdateStallAddr): pc, pilha de CALL/RET e o par SIGNAL/END. */
+typedef struct GeListCtx {
+    uint32_t pc, list_addr;
+    uint32_t stack_pc[32], stack_offset[32];
+    int sp, pending_signal, started;
+    unsigned long sig, prims, start_nz;
+} GeListCtx;
+#define GE_LIST_DONE    0   /* END após FINISH: a lista terminou */
+#define GE_LIST_STALLED 1   /* parou com pc == stall; retomar com novo stall */
+int ge_list_resume(GeListCtx *c, uint32_t stall);   /* stall 0 = sem limite */
 uint32_t ge_framebuffer(void);
 
 /* Interactive window front-end (src/rt/gui.c, Win32). gui_init opens the window; gui_present is

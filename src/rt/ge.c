@@ -2126,12 +2126,19 @@ unsigned long g_ge_list_sig=0, g_ge_prim_count=0;
 /* Per-list write accounting for SR_GEWATCH: shows whether a list that cleared a buffer
  * also drew non-black content into it, and which buffer it targeted. */
 unsigned long g_list_writes=0, g_list_nonblack=0, g_list_clearpx=0;
-static void ge_run_list_inner(uint32_t addr);
+static int ge_run_list_inner(GeListCtx *c, uint32_t stall);
 
-void ge_run_list(uint32_t addr) {
+int ge_list_resume(GeListCtx *c, uint32_t stall) {
     unsigned long t0 = wall_ms();
-    ge_run_list_inner(addr);
+    int r = ge_run_list_inner(c, stall);
     s_ge_ms_acc += wall_ms() - t0;
+    return r;
+}
+
+/* Caminho antigo (lista completa, sem stall): comportamento idêntico ao anterior. */
+void ge_run_list(uint32_t addr) {
+    GeListCtx c; memset(&c, 0, sizeof c); c.pc = addr;
+    ge_list_resume(&c, 0);
 }
 
 /* GE block transfer (the "memcpy engine"): rectangle copy between guest buffers, used for
@@ -2160,16 +2167,28 @@ static void ge_block_transfer(uint32_t startdata) {
                       ((h - 1) * dstStride + w) * bpp);
 }
 
-static void ge_run_list_inner(uint32_t addr) {
+static int ge_run_list_inner(GeListCtx *c, uint32_t stall) {
     if (!s_ge_inited) ge_state_init();
     static int snap=-1; if(snap<0) snap=(getenv("SR_FBDUMP")||getenv("SR_GEDUMP"))?1:0;
-    uint32_t list_addr=addr;
-    g_list_writes=0; g_list_nonblack=0; g_list_clearpx=0;
-    extern unsigned long g_tex_nonzero; unsigned long start_nz=g_tex_nonzero;
-    unsigned long sig=0; unsigned long prims=0;
-    uint32_t stack_pc[32], stack_offset[32]; int sp=0;
-    int pending_signal=0;
+    extern unsigned long g_tex_nonzero;
+    if (!c->started) {               /* início da lista: o que antes era feito a cada chamada */
+        c->started=1; c->list_addr=c->pc;
+        g_list_writes=0; g_list_nonblack=0; g_list_clearpx=0;
+        c->start_nz=g_tex_nonzero; c->sig=0; c->prims=0; c->sp=0; c->pending_signal=0;
+    }
+    uint32_t addr=c->pc, list_addr=c->list_addr;
+    unsigned long start_nz=c->start_nz, sig=c->sig, prims=c->prims;
+    uint32_t stack_pc[32], stack_offset[32]; int sp=c->sp;
+    memcpy(stack_pc, c->stack_pc, sizeof stack_pc); memcpy(stack_offset, c->stack_offset, sizeof stack_offset);
+    int pending_signal=c->pending_signal;
     for (int guard=0; guard<(1<<20); guard++) {
+        /* A GE para quando o pc alcança o stall; os endereços são comparados sem os bits de
+         * espelho (0x4xxxxxxx sem cache e 0x0xxxxxxx apontam para a mesma RAM). */
+        if (stall && ((addr ^ stall) & 0x0FFFFFFFu) == 0) {
+            c->pc=addr; c->sig=sig; c->prims=prims; c->sp=sp; c->pending_signal=pending_signal;
+            memcpy(c->stack_pc, stack_pc, sizeof stack_pc); memcpy(c->stack_offset, stack_offset, sizeof stack_offset);
+            return GE_LIST_STALLED;
+        }
         uint32_t op=MEM_R32(addr); addr+=4;
         uint32_t cmd=op>>24, data=op&0xFFFFFF;
         sig=sig*1000003ul+op;
@@ -2429,12 +2448,13 @@ static void ge_run_list_inner(uint32_t addr) {
                     fprintf(stderr, "GELIST f=%u list=0x%08x fbp=0x%08x prims=%lu writes=%lu nonblack=%lu clearpx=%lu\n",
                             s_ge_frame, list_addr, ge_fb_addr(), prims,
                             g_list_writes, g_list_nonblack, g_list_clearpx);
-                return;
+                return GE_LIST_DONE;
             default:
                 ge_note_unhandled_cmd(cmd, op);
                 break;
         }
     }
+    return GE_LIST_DONE;   /* guarda esgotada: mesmo fim de antes */
 }
 
 uint32_t ge_framebuffer(void) { return ge_fb_addr(); }

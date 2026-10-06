@@ -81,7 +81,8 @@ The output executable will land at `build/mygame/mygame.exe`.
 1. Place your dumped game UMD ISO in the directory containing `mygame.exe` (name it `game.iso`, or set the `PSP_ISO` environment variable to point to the ISO path).
 2. Run the game from a command prompt:
 ```bash
-build/mygame/mygame.exe --image build/mygame/mygame_image.bin 0x08804000 <entry_point_address> none none --gui
+python tools/initstate.py <path_to_eboot.elf> 0x08804000 build/mygame/init.trace
+build/mygame/mygame.exe --image build/mygame/mygame_image.bin 0x08804000 <entry_point_address> build/mygame/init.trace none --gui
 ```
 
 ## Runtime Controls

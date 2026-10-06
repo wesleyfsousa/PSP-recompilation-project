@@ -246,6 +246,7 @@ int sr_vfpu_interp(CpuState *s, uint32_t w) {
                 case 19: d[i] = sr_vfpu_cos(v[i]); break;
                 case 20: d[i] = sr_vfpu_exp2(v[i]); break;
                 case 22: d[i] = sr_vfpu_sqrt(v[i]); break;
+                case 23: d[i] = sr_vfpu_asin(v[i]); break;
                 case 24: d[i] = -sr_vfpu_rcp(v[i]); break;
                 case 26: d[i] = -sr_vfpu_sin(v[i]); break;
                 default: return SR_VFPU_OTHER;
