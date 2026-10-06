@@ -20,6 +20,9 @@ LIBS       ?= -lSDL3 -lvulkan-1 -lmfplat -lgdi32 -ldinput8 -ldxguid -lole32 -lwi
 
 BUILD_DIR  ?= build/$(GAME_NAME)
 
+# DLLs de execução da mesma toolchain do link (SDL3.dll depende de libiconv-2.dll no MSYS2)
+TOOLCHAIN_BIN ?= $(dir $(shell command -v $(CC)))
+
 RT_GE_O    := $(BUILD_DIR)/ge.o
 RT_SRCS    := src/rt/recomp.c \
               src/rt/vfpu_interp.c \
@@ -70,7 +73,7 @@ compile: $(BUILD_DIR)/$(GAME_NAME)_recomp.o $(RT_GE_O)
 		$(RT_GE_O) \
 		$(RT_SRCS) \
 		$(LIBS)
-	@cp SDL3.dll $(BUILD_DIR)/ 2>/dev/null || cp ../SDL3.dll $(BUILD_DIR)/ 2>/dev/null || true
+	@cp $(TOOLCHAIN_BIN)SDL3.dll $(TOOLCHAIN_BIN)libiconv-2.dll $(BUILD_DIR)/ 2>/dev/null || cp SDL3.dll $(BUILD_DIR)/ 2>/dev/null || cp ../SDL3.dll $(BUILD_DIR)/ 2>/dev/null || true
 	@cp -r font $(BUILD_DIR)/ 2>/dev/null || cp -r ../font $(BUILD_DIR)/ 2>/dev/null || true
 	@echo "Build finished: $(BUILD_DIR)/$(GAME_NAME).exe"
 

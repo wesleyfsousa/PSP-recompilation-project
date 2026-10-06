@@ -186,11 +186,11 @@ void gui_init(const char *title) {
                 QueryPerformanceFrequency(&s_freq);
                 QueryPerformanceCounter(&s_last);
                 s_on = 1;
-                /* Phase 1 GPU rasterizer (opt-in): captures GE triangles/sprites and
-                 * renders them on the GPU, writing results back to guest VRAM. */
+                /* Rasterizador da GE na GPU: padrão quando o SDL3/Vulkan inicializa.
+                 * SR_GPU_GE=0 força a GE em software (ge.c), útil para comparar imagens. */
                 {
                     const char *gge = getenv("SR_GPU_GE");
-                    if (gge && gge[0] && strcmp(gge, "0") != 0) {
+                    if (!(gge && strcmp(gge, "0") == 0)) {
                         if (!gegpu_init())
                             fprintf(stderr, "gui_init: GPU GE init failed; software GE active\n");
                     }
